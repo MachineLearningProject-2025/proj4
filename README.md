@@ -318,18 +318,12 @@ Project4/
 │   └── test.csv                  # mock structure (not used for scoring)
 │
 ├── src/
-│   ├── feature_engineering.py    # generate_FE_interaction_regime, shared logic
+│   ├── b
 │   ├── train_full_model.py       # FE + TS-CV + model training + export
 │   ├── backtest.py               # blend & strategy evaluation, plots
 │   ├── kaggle_predict.py         # predict() demo for Kaggle evaluation API
 │   └── utils.py                  # helper functions (metrics, plotting, etc.)
-│
-├── models_fe_rich/
-│   ├── global_scaler.pkl
-│   ├── global_pca.pkl
-│   ├── elasticnet_model.pkl
-│   ├── lightgbm_model.txt
-│   ├── feature_list.json
+
 │
 ├── notebooks/
 │   ├── 01_EDA_and_StylizedFacts.ipynb

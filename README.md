@@ -124,52 +124,11 @@ The offline pipeline does three things:
 2. **Time-series CV + OOF predictions** (`ts_cv_oof_predictions`)
 3. **Blend optimization + strategy backtest** (`search_best_k_for_blend`)
 
-Typical usage:
-
-```bash
-cd src
-
-# 1) Run full training pipeline: FE + TS-CV + blending
-python train_full_model.py
-
-# 2) Run backtest & Sharpe evaluation using OOF predictions
-python backtest.py
-```
-
-`train_full_model.py` (core steps):
-
-* Load `train.csv`
-* Drop leakage columns: `forward_returns`, `risk_free_rate` (keep only target `market_forward_excess_returns`)
-* Apply **rich FE** (lags, rolling stats, volatility regimes, macro shocks, interactions, return shocks), always based on **past** information to avoid leakage
-* Perform TimeSeriesSplit CV, training:
-
-  * **ElasticNet(PCA)**: `StandardScaler` → `PCA(15)` → `ElasticNet`
-  * **LightGBM**: raw FE
-  * (Optionally) XGBoost
-* Save:
-
-  * `global_scaler.pkl`
-  * `global_pca.pkl`
-  * `elasticnet_model.pkl`
-  * `lightgbm_model.txt`
-  * `feature_list.json` (the final feature columns used for training)
-
-`backtest.py`:
-
-* Load OOF predictions and ground-truth target
-* Construct blend: **0.95 ElasticNet + 0.05 LightGBM**
-* Compute benchmark and strategy returns under k-grid search
-* Enforce volatility ≤ 120% of benchmark
-* Report:
-
-  * mean returns, volatilities, Sharpe
-  * cumulative return curves (Figure: `cumulative_returns_comparison.png`)
-
-Outputs are saved under `models_fe_rich/` and `figures/`.
-
 ---
 
 ### 4.4. Kaggle Inference: Online predict() with Evaluation API
+
+The final result earned from the local backtest is applied to the submission code in `src/elastic-lgmb_weight_scale.ipynb`.
 
 Kaggle’s evaluation environment:
 
@@ -191,121 +150,9 @@ Core idea:
 * Use `lagged_market_forward_excess_returns` as the y_{t−1} equivalent
 * Reproduce the **same FE logic as train**, but online & incremental
 * Select `feature_list` columns in the correct order
-* Apply:
+* Apply models and blend predictions as trained locally.
 
-  * `global_scaler` → `global_pca` → `elasticnet_model`
-  * `lightgbm_model` on **raw FE**
-  * Blend: `0.95 * pred_enet + 0.05 * pred_lgb`
-
-Example (simplified) Kaggle-side script:
-
-```python
-import numpy as np
-import polars as pl
-import pickle
-import json
-import lightgbm as lgb
-
-MODEL_PATH = "/kaggle/input/hull-tactical-dataset"
-
-with open(f"{MODEL_PATH}/global_scaler.pkl", "rb") as f:
-    scaler = pickle.load(f)
-
-with open(f"{MODEL_PATH}/global_pca.pkl", "rb") as f:
-    pca = pickle.load(f)
-
-with open(f"{MODEL_PATH}/elasticnet_model.pkl", "rb") as f:
-    enet = pickle.load(f)
-
-lgb_model = lgb.Booster(model_file=f"{MODEL_PATH}/lightgbm_model.txt")
-
-with open(f"{MODEL_PATH}/feature_list.json", "r") as f:
-    feature_list = json.load(f)
-
-BUFFER = { "rows": [] }
-
-def make_test_FE(row: pl.DataFrame):
-
-    global BUFFER
-    BUFFER["rows"].append(row.to_dicts()[0])
-    df = pl.from_dicts(BUFFER["rows"])
-
-    # use lagged_market_forward_excess_returns as y_{t-1}
-    df = df.with_columns([
-        pl.col("lagged_market_forward_excess_returns").alias("y_lag1")
-    ])
-
-    # (1) rolling stats on y_lag1
-    for w in [5,10,21,63]:
-        df = df.with_columns([
-            pl.col("y_lag1").rolling_mean(w).alias(f"roll_mean_{w}"),
-            pl.col("y_lag1").rolling_std(w).alias(f"roll_std_{w}"),
-        ])
-
-    # (2) volatility regime
-    df = df.with_columns([
-        pl.col("y_lag1").rolling_std(21).alias("vol21"),
-        pl.col("y_lag1").rolling_std(63).alias("vol63")
-    ])
-    df = df.with_columns([
-        (pl.col("vol21") > pl.col("vol63")).cast(pl.Int8).alias("high_vol"),
-        (pl.col("vol21") / (pl.col("vol63") + 1e-9)).alias("vol_slope"),
-    ])
-
-    # (3) macro shock on E*
-    macro_cols = [c for c in df.columns if c.startswith("E")]
-    for col in macro_cols:
-        df = df.with_columns([
-            ((pl.col(col) - pl.col(col).rolling_mean(63)) /
-             (pl.col(col).rolling_std(63) + 1e-9)).alias(f"{col}_z")
-        ])
-        df = df.with_columns([
-            (pl.col(f"{col}_z").abs() > 2).cast(pl.Int8).alias(f"{col}_shock")
-        ])
-
-    shock_cols = [c for c in df.columns if c.endswith("_shock")]
-    if shock_cols:
-        df = df.with_columns([
-            sum([pl.col(c) for c in shock_cols]).alias("macro_shock_sum"),
-            (pl.col("macro_shock_sum") >= 3).cast(pl.Int8).alias("macro_crisis"),
-        ])
-    else:
-        df = df.with_columns([
-            pl.lit(0).alias("macro_shock_sum"),
-            pl.lit(0).cast(pl.Int8).alias("macro_crisis"),
-        ])
-
-    # (4) interaction: first few M and V
-    m_cols = [c for c in df.columns if c.startswith("M")][:5]
-    v_cols = [c for c in df.columns if c.startswith("V")][:5]
-    for m in m_cols:
-        for v in v_cols:
-            df = df.with_columns((pl.col(m) * pl.col(v)).alias(f"{m}_x_{v}"))
-
-    last = df.tail(1)
-
-    # align with train-time features
-    last = last.select([c for c in feature_list if c in last.columns])
-
-    return last
-
-def predict(test: pl.DataFrame) -> float:
-
-    fe = make_test_FE(test)
-    X = fe.to_numpy()
-
-    X_scaled = scaler.transform(X)
-    X_pca = pca.transform(X_scaled)
-    pred_en = enet.predict(X_pca)
-
-    pred_lgb = lgb_model.predict(X)
-
-    pred = 0.95 * pred_en + 0.05 * pred_lgb
-
-    return float(pred[0])
-```
-
-You then plug this into the provided evaluation template (`default_inference_server`) and submit the notebook.
+You then typically plug this into the provided evaluation template (`default_inference_server`) and submit your solution. This process is often demonstrated within a Kaggle-specific notebook.
 
 ---
 
@@ -314,31 +161,19 @@ You then plug this into the provided evaluation template (`default_inference_ser
 ```text
 Project4/
 ├── data/
-│   ├── train.csv
-│   └── test.csv                  # mock structure (not used for scoring)
+│   ├── submission.csv
+│   ├── test.csv
+│   └── train.csv
+│
+├── notebook/
+│   ├── 01_eda_baseline.ipynb
+│   ├── 02_Feature_Engineering_PCA.ipynb
+│   └── 03_Modeling_with_Backtest.ipynb
 │
 ├── src/
-│   ├── b
-│   ├── train_full_model.py       # FE + TS-CV + model training + export
-│   ├── backtest.py               # blend & strategy evaluation, plots
-│   ├── kaggle_predict.py         # predict() demo for Kaggle evaluation API
-│   └── utils.py                  # helper functions (metrics, plotting, etc.)
-
-│
-├── notebooks/
-│   ├── 01_EDA_and_StylizedFacts.ipynb
-│   ├── 02_TS_CV_Modeling.ipynb
-│   ├── 03_Blend_and_Strategy.ipynb
-│   └── 04_Kaggle_Inference_Demo.ipynb
-│
-├── figures/
-│   ├── eda_returns_distribution.png
-│   ├── ts_cv_rmse.png
-│   ├── cumulative_returns_comparison.png
-│   ├── volatility_ratio_plot.png
-│
-├── report/
-│   └── Assignment4_TeamID_StudentID_Lastname_Firstname.pdf
+│   ├── baseline_submission.ipynb
+│   ├── elastic-lgmb_weight_scale.ipynb
+│   └── submission.csv
 │
 ├── requirements.txt
 └── README.md
